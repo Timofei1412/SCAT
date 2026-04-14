@@ -1,0 +1,52 @@
+# ==========================================
+# SolidWorks .gitignore Template
+# ==========================================
+
+# SOLIDWORKS MAIN FILES (TRACK THESE)
+# *.sldprt
+# *.sldasm
+# *.slddrw
+
+# --- TEMPORARY & AUTOSAVE FILES ---
+.swp
+.sldbak
+.sldtmp
+*~
+.~*
+~$*.*
+$*.*
+
+# --- PREVIEW & SYSTEM CACHE ---
+Thumbs.db
+.DS_Store
+ehthumbs.db
+Desktop.ini
+._*
+*.sldrtv
+
+# --- SIMULATION & ANALYSIS RESULTS ---
+# (Often very large, binary, and reproducible from geometry)
+.cwb
+.sldsim
+.htr
+.res
+.sldsimdata
+
+# --- EXPORTS & PACKAGES ---
+# (Uncomment if you also want to version-control exports)
+# *.sldpkg
+# *.easm
+# *.eprt
+# *.edrw
+# *.step
+# *.stp
+# *.iges
+# *.igs
+# *.pdf
+# *.dxf
+# *.dwg
+
+# --- MACRO & SCRIPT BACKUPS ---
+.swm
+.bas~
+.frm~
