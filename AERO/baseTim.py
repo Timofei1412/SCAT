@@ -1,64 +1,232 @@
 import aerosandbox as asb
-import numpy as np
+import aerosandbox.numpy as np
 
-# 1. Сечения фюзеляжа (используем x, y, z вместо xyz_center)
-fuselage_xsecs = [
-    asb.FuselageXSec([0.0, 0, 0], radius = 0.1),
-    asb.FuselageXSec([0.5, 0, 0], radius =  0.25),
-    asb.FuselageXSec([2.0, 0, 0], radius =  0.25),
-    asb.FuselageXSec([4.0, 0, 0], radius =  0.25),
-    asb.FuselageXSec([5.5, 0, 0], radius =  0.01),
-]
+# =========================================================
+# AIRFOILS
+# =========================================================
 
-fuselage = asb.Fuselage(
-    name="Main Fuselage",
-    xsecs=fuselage_xsecs,
-    symmetry="XZ"  # Зеркалим по вертикали (верх/низ)
-)
+wing_airfoil = asb.Airfoil("naca2412")
+tail_airfoil = asb.Airfoil("naca0015")
 
-# 2. Крыло (твой код без изменений)
-airfoil = asb.Airfoil("naca2412")  # Более "самолётный" профиль
+# =========================================================
+# BASIC PARAMETERS
+# =========================================================
+
+span_total = 1.30
+half_span = span_total / 2
+tip_dihedral_z = 0.035
+# хорды (логичное сужение)
+# хорды (уменьшенные законцовки в 2 раза)
+root_chord = 0.255
+mid_chord = 0.220
+pre_tip_chord = 0.170
+
+tip_mid_chord = 0.070   # было 0.140
+tip_chord = 0.055       # было 0.110
+
+# крутка (без изменений)
+root_twist = 2
+mid_twist = 0
+pre_tip_twist = -2
+tip_mid_twist = -4
+tip_twist = -6
+
+# законцовка по размаху (чуть уменьшили размер)
+y_root = 0.0
+y_mid = half_span * 0.45
+y_pre_tip = half_span * 0.75
+y_tip_mid = half_span * 0.85   # было 0.90
+y_tip = half_span * 0.88        # было 1.00
+
+# X не трогаем
+x_root = -0.08
+x_mid = 0.00
+x_pre_tip = 0.08
+x_tip_mid = 0.20
+x_tip = 0.24
+
+# =========================================================
+# MAIN WING
+# =========================================================
 
 wing = asb.Wing(
-    name="Swept Wing",
+    name="Main Wing",
     symmetric=True,
+
     xsecs=[
-        # Корень: без стреловидности
-        asb.WingXSec(xyz_le=[4+0, 0, 0], chord=1.5, twist=2.0, airfoil=airfoil),
-        # Середина: стреловидность назад + небольшое опускание
-        asb.WingXSec(xyz_le=[4+0.3, 2, 0.1], chord=1.0, twist=-1.5, airfoil=airfoil),
-        # Законцовка: сильнее стреловидность + отрицательный поперечный V
-        asb.WingXSec(xyz_le=[4+1, 2.5, 0.4], chord=0.5, twist=-3.0, airfoil=airfoil),
+
+        # ROOT
+        asb.WingXSec(
+            xyz_le=[x_root, y_root, 0.0],
+            chord=root_chord,
+            twist=root_twist,
+            airfoil=wing_airfoil
+        ),
+
+        # MID (центр полу-крыла)
+        asb.WingXSec(
+            xyz_le=[x_mid, y_mid, 0.0],
+            chord=mid_chord,
+            twist=mid_twist,
+            airfoil=wing_airfoil
+        ),
+
+        # BEFORE TIP
+        asb.WingXSec(
+            xyz_le=[x_pre_tip, y_pre_tip, 0.0],
+            chord=pre_tip_chord,
+            twist=pre_tip_twist,
+            airfoil=wing_airfoil
+        ),
+
+        # TIP MID (середина законцовки)
+        asb.WingXSec(
+            xyz_le=[x_tip_mid, y_tip_mid, tip_dihedral_z],
+            chord=tip_mid_chord,
+            twist=tip_mid_twist,
+            airfoil=wing_airfoil
+        ),
+
+        # TIP EDGE (край законцовки)
+        asb.WingXSec(
+            xyz_le=[x_tip, y_tip, 2*tip_dihedral_z],
+            chord=tip_chord,
+            twist=tip_twist,
+            airfoil=wing_airfoil
+        ),
     ]
 )
 
-# --- 🆕 ДОБАВЛЕНО: Цельноповоротное ПГО (Канарды) ---
-canard = asb.Wing(
-    name="All-Moving Canard",
-    symmetric=True,
+# =========================================================
+# CENTER FUSELAGE
+# =========================================================
+
+fuselage = asb.Fuselage(
+    name="Center Fuselage",
     xsecs=[
-        # Корень ПГО: впереди крыла (x=0.8), у борта фюзеляжа (y=0.35)
-        asb.WingXSec(xyz_le=[0.9, 0.1, -0.05], chord=0.7, twist=0.0, airfoil=airfoil),
-        # Середина ПГО: умеренная стреловидность
-        asb.WingXSec(xyz_le=[1.2, 0.9, 0.0], chord=0.5, twist=0.0, airfoil=airfoil),
-        # Концовка ПГО: компактная
-        asb.WingXSec(xyz_le=[1.5, 1.4, 0.07], chord=0.3, twist=1.0, airfoil=airfoil),
+
+        asb.FuselageXSec(xyz_c=[-0.32, 0, -0.01], radius=0.034),
+        asb.FuselageXSec(xyz_c=[-0.12, 0, 0], radius=0.0520),
+        asb.FuselageXSec(xyz_c=[0.08, 0, 0], radius=0.052),
+        asb.FuselageXSec(xyz_c=[0.18, 0, 0], radius=0.045),
+        asb.FuselageXSec(xyz_c=[0.24, 0, 0], radius=0.012),
     ]
 )
-# ----------------------------------------------------
 
-# 3. Сборка (добавляем ПГО в список wings)
-airplane = asb.Airplane(
-    name="My Concept",
-    wings=[canard, wing],  # 🔹 ПГО и крыло в одном списке
-    fuselages=[fuselage]
+# =========================================================
+# BOOMS
+# =========================================================
+
+boom_spacing = 0.320
+boom_half_y = boom_spacing / 2
+
+boom_start_x = 0.16
+boom_length = 0.505
+boom_z = 0.0
+
+left_boom = asb.Fuselage(
+    name="Left Boom",
+    xsecs=[
+        asb.FuselageXSec(xyz_c=[boom_start_x, boom_half_y, boom_z], radius=0.008),
+        asb.FuselageXSec(xyz_c=[boom_start_x + boom_length, boom_half_y, boom_z], radius=0.008),
+    ]
 )
 
-# 4. Визуализация
-airplane.draw(
-    backend='pyvista', 
-    thin_wings=False,          
-    use_preset_view_angle='iso',
-    set_background_pane_color='white',
-    show=True
+right_boom = asb.Fuselage(
+    name="Right Boom",
+    xsecs=[
+        asb.FuselageXSec(xyz_c=[boom_start_x, -boom_half_y, boom_z], radius=0.008),
+        asb.FuselageXSec(xyz_c=[boom_start_x + boom_length, -boom_half_y, boom_z], radius=0.008),
+    ]
 )
+
+# =========================================================
+# TAIL (оставил как у тебя)
+# =========================================================
+
+tail_airfoil = asb.Airfoil("naca0015")
+
+tail_x = boom_start_x + boom_length - 0.15
+tail_tip_z = 0.15
+boom_half_y = boom_spacing / 2
+
+left_tail = asb.Wing(
+    name="Left Tail",
+    symmetric=False,
+    xsecs=[
+        asb.WingXSec(
+            xyz_le=[tail_x, boom_half_y, boom_z],
+            chord=0.15,
+            twist=0,
+            airfoil=tail_airfoil
+        ),
+        asb.WingXSec(
+            xyz_le=[tail_x + 0.03, 0.0, tail_tip_z],
+            chord=0.10,
+            twist=0,
+            airfoil=tail_airfoil
+        ),
+    ]
+)
+
+right_tail = asb.Wing(
+    name="Right Tail",
+    symmetric=False,
+    xsecs=[
+        asb.WingXSec(
+            xyz_le=[tail_x, -boom_half_y, boom_z],
+            chord=0.15,
+            twist=0,
+            airfoil=tail_airfoil
+        ),
+        asb.WingXSec(
+            xyz_le=[tail_x + 0.03, 0.0, tail_tip_z],
+            chord=0.10,
+            twist=0,
+            airfoil=tail_airfoil
+        ),
+    ]
+)
+
+# =========================================================
+# AIRPLANE
+# =========================================================
+
+plane = asb.Airplane(
+    name="Refined Wing UAV",
+
+    wings=[wing, left_tail, right_tail],
+
+    fuselages=[fuselage, left_boom, right_boom]
+)
+
+# =========================================================
+# FLIGHT
+# =========================================================
+
+op_point = asb.OperatingPoint(
+    velocity=25,
+    alpha=3
+)
+
+analysis = asb.VortexLatticeMethod(
+    airplane=plane,
+    op_point=op_point
+)
+
+results = analysis.run()
+
+print("\nCL:", results["CL"])
+print("CD:", results["CD"])
+print("L/D:", results["CL"]/results["CD"])
+
+
+if __name__ == "__main__":
+    # Только при прямом запуске скрипта выполняем анализ и GUI-рендер.
+    print("\nRunning baseTim as script: performing analysis and render")
+    print("CL:", results["CL"])
+    print("CD:", results["CD"])
+    print("L/D:", results["CL"]/results["CD"])
+
+    # Открываем окно рендера только из основного процесса/thread
+    plane.draw(backend="pyvista", thin_wings=False, show=True)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import socketserver
 import sys
@@ -78,6 +79,7 @@ class AircraftConfig:
     draw_backend: str = "pyvista"
     thin_wings: bool = False
     fuselage_sections: list[FuselageSection] = field(default_factory=list)
+    extra_fuselages: list[list[FuselageSection]] = field(default_factory=list)
     wing: SurfaceConfig = field(default_factory=lambda: SurfaceConfig(name="Main Wing"))
     canard: SurfaceConfig = field(default_factory=lambda: SurfaceConfig(name="Canard", enabled=True))
     htail: SurfaceConfig = field(default_factory=lambda: SurfaceConfig(name="Horizontal Tail", enabled=False))
@@ -91,58 +93,259 @@ class AircraftConfig:
     )
 
 
-def default_config() -> AircraftConfig:
-    return AircraftConfig(
-        fuselage_sections=[
-            FuselageSection(0.0, 0.0, 0.0, 0.10),
-            FuselageSection(0.5, 0.0, 0.0, 0.25),
-            FuselageSection(2.0, 0.0, 0.0, 0.25),
-            FuselageSection(4.0, 0.0, 0.0, 0.25),
-            FuselageSection(5.5, 0.0, 0.0, 0.01),
-        ],
-        wing=SurfaceConfig(
-            name="Swept Wing",
+def _classify_surfaces_from_wings(wings_data: list[dict]) -> tuple[SurfaceConfig, SurfaceConfig, SurfaceConfig, SurfaceConfig]:
+    wing_cfg = None
+    canard_cfg = SurfaceConfig(name="Canard", enabled=False)
+    htail_cfg = SurfaceConfig(name="Horizontal Tail", enabled=False)
+    vtail_cfg = SurfaceConfig(name="Vertical Tail", enabled=False, symmetric=False)
+    fallback_surfaces = []
+    htail_candidates: list[SurfaceConfig] = []
+
+    for wing_data in wings_data:
+        name = wing_data.get("name", "wing") or "wing"
+        sections = [
+            SurfaceSection(
+                x=float(section.get("x", 0.0)),
+                y=float(section.get("y", 0.0)),
+                z=float(section.get("z", 0.0)),
+                chord=float(section.get("chord", 0.1)),
+                twist=float(section.get("twist", 0.0)),
+            )
+            for section in wing_data.get("sections", [])
+        ]
+        cfg = SurfaceConfig(
+            name=name,
             enabled=True,
-            symmetric=True,
-            color="#2468f2",
-            sections=[
-                SurfaceSection(4.0, 0.0, 0.0, 1.5, 2.0),
-                SurfaceSection(4.3, 2.0, 0.1, 1.0, -1.5),
-                SurfaceSection(5.0, 2.5, 0.4, 0.5, -3.0),
-            ],
-        ),
-        canard=SurfaceConfig(
-            name="All-Moving Canard",
+            symmetric=bool(wing_data.get("symmetric", True)),
+            sections=sections,
+        )
+        fallback_surfaces.append(cfg)
+        lname = name.lower()
+        if "canard" in lname or "front" in lname:
+            canard_cfg = cfg
+        elif "main" in lname or ("wing" in lname and "tail" not in lname):
+            wing_cfg = cfg
+        elif "tail" in lname and ("v" in lname or "vertical" in lname):
+            vtail_cfg = cfg
+        elif "tail" in lname:
+            htail_candidates.append(cfg)
+
+    # Если хвост задан двумя независимыми половинами (Left/Right Tail),
+    # сохраняем обе, чтобы не терять реальную геометрию из baseTim.
+    if len(htail_candidates) >= 2:
+        left_like = next(
+            (c for c in htail_candidates if any(section.y > 0 for section in c.sections)),
+            htail_candidates[0],
+        )
+        right_like = next(
+            (c for c in htail_candidates if c is not left_like),
+            htail_candidates[1],
+        )
+        htail_cfg = SurfaceConfig(
+            name=left_like.name or "Left Tail",
             enabled=True,
-            symmetric=True,
-            color="#ff8c3b",
-            sections=[
-                SurfaceSection(0.9, 0.1, -0.05, 0.7, 0.0),
-                SurfaceSection(1.2, 0.9, 0.0, 0.5, 0.0),
-                SurfaceSection(1.5, 1.4, 0.07, 0.3, 1.0),
-            ],
-        ),
-        htail=SurfaceConfig(
-            name="Horizontal Tail",
-            enabled=False,
-            symmetric=True,
-            color="#7e57ff",
-            sections=[
-                SurfaceSection(4.6, 0.0, 0.15, 0.8, 0.0),
-                SurfaceSection(4.9, 1.0, 0.2, 0.45, -1.0),
-            ],
-        ),
-        vtail=SurfaceConfig(
-            name="Vertical Tail",
-            enabled=False,
             symmetric=False,
-            color="#26a269",
-            sections=[
-                SurfaceSection(4.7, 0.0, 0.10, 0.95, 0.0),
-                SurfaceSection(5.0, 0.0, 0.95, 0.35, 0.0),
-            ],
-        ),
+            color=left_like.color,
+            sections=left_like.sections,
+        )
+        # Используем слот vtail как вторую независимую хвостовую плоскость.
+        vtail_cfg = SurfaceConfig(
+            name=right_like.name or "Right Tail",
+            enabled=True,
+            symmetric=False,
+            color=right_like.color,
+            sections=right_like.sections,
+        )
+    elif htail_candidates:
+        htail_cfg = htail_candidates[0]
+
+    if wing_cfg is None:
+        wing_cfg = next(
+            (surface for surface in fallback_surfaces if "wing" in surface.name.lower() and "tail" not in surface.name.lower()),
+            fallback_surfaces[0] if fallback_surfaces else SurfaceConfig(name="Main Wing", enabled=False),
+        )
+
+    return wing_cfg, canard_cfg, htail_cfg, vtail_cfg
+
+
+def _extract_basetim_data_via_subprocess(project_root: Path) -> dict | None:
+    extractor = (
+        "import contextlib, io, json, sys\n"
+        f"sys.path.insert(0, {repr(str(project_root))})\n"
+        "with contextlib.redirect_stdout(io.StringIO()):\n"
+        "  import baseTim\n"
+        "plane = baseTim.plane\n"
+        "data = {\n"
+        "  'fuselages': [\n"
+        "    [\n"
+        "      {\n"
+        "        'x': float(x.xyz_c[0]), 'y': float(x.xyz_c[1]), 'z': float(x.xyz_c[2]),\n"
+        "        'radius': float(x.equivalent_radius() if hasattr(x, 'equivalent_radius') else getattr(x, 'radius', 0.1))\n"
+        "      }\n"
+        "      for x in getattr(f, 'xsecs', [])\n"
+        "      if getattr(x, 'xyz_c', None) is not None\n"
+        "    ]\n"
+        "    for f in getattr(plane, 'fuselages', [])\n"
+        "  ],\n"
+        "  'wings': [\n"
+        "    {\n"
+        "      'name': getattr(w, 'name', 'wing') or 'wing',\n"
+        "      'symmetric': bool(getattr(w, 'symmetric', True)),\n"
+        "      'sections': [\n"
+        "        {\n"
+        "          'x': float(x.xyz_le[0]), 'y': float(x.xyz_le[1]), 'z': float(x.xyz_le[2]),\n"
+        "          'chord': float(getattr(x, 'chord', 0.1)), 'twist': float(getattr(x, 'twist', 0.0))\n"
+        "        }\n"
+        "        for x in getattr(w, 'xsecs', [])\n"
+        "      ]\n"
+        "    }\n"
+        "    for w in getattr(plane, 'wings', [])\n"
+        "  ]\n"
+        "}\n"
+        "print(json.dumps(data, ensure_ascii=False))\n"
     )
+
+    interpreters = [
+        str(project_root / "tf-env" / "bin" / "python"),
+        str(project_root / ".venv" / "bin" / "python"),
+        str(project_root / "tf-env" / "bin" / "python3"),
+        str(project_root / ".venv" / "bin" / "python3"),
+        "python3",
+        "python",
+    ]
+    for interpreter in interpreters:
+        if "/" in interpreter and not Path(interpreter).exists():
+            continue
+        if "/" not in interpreter and shutil.which(interpreter) is None:
+            continue
+        try:
+            completed = subprocess.run(
+                [interpreter, "-c", extractor],
+                check=True,
+                capture_output=True,
+                text=True,
+                cwd=str(project_root),
+            )
+            return json.loads(completed.stdout)
+        except Exception:
+            continue
+    return None
+
+
+def _build_config_from_basetim_data(data: dict) -> AircraftConfig | None:
+    fuselage_chains = []
+    for chain in data.get("fuselages", []):
+        if not isinstance(chain, list):
+            continue
+        sections = [
+            FuselageSection(
+                x=float(section.get("x", 0.0)),
+                y=float(section.get("y", 0.0)),
+                z=float(section.get("z", 0.0)),
+                radius=float(section.get("radius", 0.1)),
+            )
+            for section in chain
+            if isinstance(section, dict)
+        ]
+        if len(sections) >= 2:
+            fuselage_chains.append(sections)
+
+    if not fuselage_chains:
+        return None
+
+    primary_index = max(
+        range(len(fuselage_chains)),
+        key=lambda idx: abs(fuselage_chains[idx][-1].x - fuselage_chains[idx][0].x),
+    )
+    fus_sections = fuselage_chains[primary_index]
+    extra_fuselages = [chain for idx, chain in enumerate(fuselage_chains) if idx != primary_index]
+
+    wing_cfg, canard_cfg, htail_cfg, vtail_cfg = _classify_surfaces_from_wings(data.get("wings", []))
+
+    return AircraftConfig(
+        fuselage_sections=fus_sections,
+        extra_fuselages=extra_fuselages,
+        wing=wing_cfg,
+        canard=canard_cfg,
+        htail=htail_cfg,
+        vtail=vtail_cfg,
+    )
+
+
+def default_config() -> AircraftConfig:
+  # Попробовать импортировать пользовательский базовый скрипт `baseTim.py`.
+  project_root = Path(__file__).resolve().parent
+  try:
+    extracted = _extract_basetim_data_via_subprocess(project_root)
+    if extracted is not None:
+      config = _build_config_from_basetim_data(extracted)
+      if config is not None:
+        return config
+
+  except Exception:
+    # Если импорт не удался — продолжаем к дефолтной жёстко заданной конструкции
+    pass
+
+  # Фолбэк-дефолт: геометрия из baseTim.py
+  return AircraftConfig(
+    fuselage_sections=[
+      FuselageSection(-0.32, 0.0, -0.01, 0.034),
+      FuselageSection(-0.12, 0.0, 0.0, 0.052),
+      FuselageSection(0.08, 0.0, 0.0, 0.052),
+      FuselageSection(0.18, 0.0, 0.0, 0.045),
+      FuselageSection(0.24, 0.0, 0.0, 0.012),
+    ],
+    extra_fuselages=[
+      [
+        FuselageSection(0.16, 0.16, 0.0, 0.008),
+        FuselageSection(0.665, 0.16, 0.0, 0.008),
+      ],
+      [
+        FuselageSection(0.16, -0.16, 0.0, 0.008),
+        FuselageSection(0.665, -0.16, 0.0, 0.008),
+      ],
+    ],
+    wing=SurfaceConfig(
+      name="Main Wing",
+      enabled=True,
+      symmetric=True,
+      color="#2468f2",
+      sections=[
+        SurfaceSection(-0.08, 0.0, 0.0, 0.255, 2.0),
+        SurfaceSection(0.0, 0.2925, 0.0, 0.220, 0.0),
+        SurfaceSection(0.08, 0.4875, 0.0, 0.170, -2.0),
+        SurfaceSection(0.20, 0.5525, 0.035, 0.070, -4.0),
+        SurfaceSection(0.24, 0.5720, 0.070, 0.055, -6.0),
+      ],
+    ),
+    canard=SurfaceConfig(
+      name="Canard",
+      enabled=False,
+      symmetric=True,
+      color="#ff8c3b",
+      sections=[],
+    ),
+    htail=SurfaceConfig(
+      name="Left Tail",
+      enabled=True,
+      symmetric=False,
+      color="#7e57ff",
+      sections=[
+        SurfaceSection(0.515, 0.16, 0.0, 0.15, 0.0),
+        SurfaceSection(0.545, 0.0, 0.15, 0.10, 0.0),
+      ],
+    ),
+    vtail=SurfaceConfig(
+      name="Right Tail",
+      enabled=True,
+      symmetric=False,
+      color="#26a269",
+      sections=[
+        SurfaceSection(0.515, -0.16, 0.0, 0.15, 0.0),
+        SurfaceSection(0.545, 0.0, 0.15, 0.10, 0.0),
+      ],
+    ),
+  )
 
 
 def surface_to_dict(surface: SurfaceConfig) -> dict:
@@ -154,6 +357,10 @@ def surface_to_dict(surface: SurfaceConfig) -> dict:
 def config_to_dict(config: AircraftConfig) -> dict:
     data = asdict(config)
     data["fuselage_sections"] = [asdict(section) for section in config.fuselage_sections]
+    data["extra_fuselages"] = [
+        [asdict(section) for section in chain]
+        for chain in config.extra_fuselages
+    ]
     data["wing"] = surface_to_dict(config.wing)
     data["canard"] = surface_to_dict(config.canard)
     data["htail"] = surface_to_dict(config.htail)
@@ -180,6 +387,11 @@ def config_from_dict(data: dict) -> AircraftConfig:
         draw_backend=data.get("draw_backend", "pyvista"),
         thin_wings=data.get("thin_wings", False),
         fuselage_sections=[FuselageSection(**section) for section in data.get("fuselage_sections", [])],
+        extra_fuselages=[
+            [FuselageSection(**section) for section in chain]
+            for chain in data.get("extra_fuselages", [])
+            if isinstance(chain, list)
+        ],
         wing=load_surface(data.get("wing", {}), "Main Wing", "#2468f2", True),
         canard=load_surface(data.get("canard", {}), "Canard", "#ff8c3b", True),
         htail=load_surface(data.get("htail", {}), "Horizontal Tail", "#7e57ff", True),
@@ -194,7 +406,7 @@ def build_airplane(config: AircraftConfig):
         raise ValueError("Для фюзеляжа нужно минимум 2 секции.")
 
     airfoil = asb.Airfoil(config.airfoil_name)
-    fuselage = asb.Fuselage(
+    primary_fuselage = asb.Fuselage(
         name=config.fuselage_name,
         xsecs=[
             asb.FuselageXSec(xyz_c=[section.x, section.y, section.z], radius=section.radius)
@@ -202,6 +414,20 @@ def build_airplane(config: AircraftConfig):
         ],
         symmetry=None if config.fuselage_symmetry == "none" else config.fuselage_symmetry,
     )
+    fuselages = [primary_fuselage]
+    for idx, chain in enumerate(config.extra_fuselages, start=1):
+        if len(chain) < 2:
+            continue
+        fuselages.append(
+            asb.Fuselage(
+                name=f"{config.fuselage_name} Extra {idx}",
+                xsecs=[
+                    asb.FuselageXSec(xyz_c=[section.x, section.y, section.z], radius=section.radius)
+                    for section in chain
+                ],
+                symmetry=None,
+            )
+        )
 
     wings = []
     for surface in (config.canard, config.wing, config.htail, config.vtail):
@@ -225,7 +451,7 @@ def build_airplane(config: AircraftConfig):
             )
         )
 
-    return asb.Airplane(name=config.airplane_name, wings=wings, fuselages=[fuselage])
+    return asb.Airplane(name=config.airplane_name, wings=wings, fuselages=fuselages)
 
 
 def fuselage_length(config: AircraftConfig) -> float:
@@ -267,7 +493,7 @@ except ImportError:
 CONFIG = json.loads('''{data}''')
 
 airfoil = asb.Airfoil(CONFIG["airfoil_name"])
-fuselage = asb.Fuselage(
+primary_fuselage = asb.Fuselage(
     name=CONFIG["fuselage_name"],
     xsecs=[
         asb.FuselageXSec(
@@ -278,6 +504,23 @@ fuselage = asb.Fuselage(
     ],
     symmetry=None if CONFIG["fuselage_symmetry"] == "none" else CONFIG["fuselage_symmetry"],
 )
+fuselages = [primary_fuselage]
+for idx, chain in enumerate(CONFIG.get("extra_fuselages", []), start=1):
+    if len(chain) < 2:
+        continue
+    fuselages.append(
+        asb.Fuselage(
+            name=f"{{CONFIG['fuselage_name']}} Extra {{idx}}",
+            xsecs=[
+                asb.FuselageXSec(
+                    xyz_c=[section["x"], section["y"], section["z"]],
+                    radius=section["radius"],
+                )
+                for section in chain
+            ],
+            symmetry=None,
+        )
+    )
 
 wings = []
 for surface_key in ["canard", "wing", "htail", "vtail"]:
@@ -303,7 +546,7 @@ for surface_key in ["canard", "wing", "htail", "vtail"]:
 airplane = asb.Airplane(
     name=CONFIG["airplane_name"],
     wings=wings,
-    fuselages=[fuselage],
+    fuselages=fuselages,
 )
 
 airplane.draw(
@@ -508,6 +751,10 @@ def html_page() -> str:
       border: 1px solid var(--line);
       background: linear-gradient(180deg, #fbfdff 0%, #edf4fb 100%);
     }
+    canvas.stability-chart {
+      height: 280px;
+      max-height: 42vh;
+    }
     .summary {
       white-space: pre-wrap;
       line-height: 1.5;
@@ -602,6 +849,17 @@ def html_page() -> str:
         <div class="card">
           <h3>Параметры оптимизации</h3>
           <div class="grid">
+            <div class="field full">
+              <label for="optMode">Режим оптимизации</label>
+              <select id="optMode">
+                <option value="algorithm">🧬 Algorithm (CEM) - быстро, универсально</option>
+                <option value="ai">🤖 AI (Нейросеть) - требует модель, очень быстро</option>
+                <option value="ai+algorithm">🔄 Гибридный (AI+CEM) - балансированно</option>
+              </select>
+              <div class="tip" style="margin-top: 6px;">
+                Algorithm: генетическая оптимизация | AI: нейросеть (если обучена) | Гибридный: оба метода
+              </div>
+            </div>
             <div class="field">
               <label for="optIterations">Итерации</label>
               <input id="optIterations" type="number" value="10" min="1" step="1">
@@ -609,6 +867,10 @@ def html_page() -> str:
             <div class="field">
               <label for="optPopulation">Популяция</label>
               <input id="optPopulation" type="number" value="20" min="4" step="1">
+            </div>
+            <div class="field">
+              <label for="optMinWingArea">Мин. площадь крыла</label>
+              <input id="optMinWingArea" type="number" value="0.3" min="0.1" step="0.05">
             </div>
             <div class="field">
               <label for="optTargetCl">Целевой CL</label>
@@ -625,6 +887,18 @@ def html_page() -> str:
           <span class="legend-item"><span class="legend-line optimized"></span>Оптимизированная конфигурация</span>
         </div>
         <canvas id="preview" width="900" height="560"></canvas>
+        <div class="card">
+          <h3>График 6 — стабильность и ограничения</h3>
+          <div class="tip">
+            Как в analyze_wing (график 6 датасета): столбцы 0/1 по критериям (образец, валидность ТЗ, площадь, крен Clp, рысканье Cnr, тангаж Cma).
+            Расчёт: AeroBuildup, α = 0°, параметры из блока слева. Кнопка запрашивает сервер.
+          </div>
+          <div class="toolbar" style="margin: 10px 0;">
+            <button class="good" id="stabilityBtn" type="button">Проверить стабильность</button>
+          </div>
+          <canvas id="stabilityChart6" class="stability-chart" width="900" height="280"></canvas>
+          <div class="summary" id="stabilityMetrics" style="margin-top:10px;">Метрики появятся после проверки.</div>
+        </div>
         <div class="summary" id="summary"></div>
         <div class="summary" id="optimizationSummary">Оптимизация ещё не запускалась.</div>
       </div>
@@ -642,9 +916,18 @@ def html_page() -> str:
       ["tab-vtail", "ВО"],
     ];
 
-    let state = structuredClone(defaultConfig);
+    function deepClone(value) {
+      if (typeof structuredClone === "function") {
+        return structuredClone(value);
+      }
+      return JSON.parse(JSON.stringify(value));
+    }
+
+    let state = deepClone(defaultConfig);
     let optimizedState = null;
     let optimizationResult = null;
+    let stabilityChart6Data = null;
+    let stabilityEvaluationText = "";
 
     function setStatus(text) {
       document.getElementById("status").textContent = text;
@@ -713,15 +996,6 @@ def html_page() -> str:
               экспорт JSON и генерация готового Python-кода для AeroSandbox.
             </div>
           </div>
-          <div class="card">
-            <h3>Параметры оптимизации</h3>
-            <div class="grid">
-              ${inputField("optIterations", "Итерации", "5", "number")}
-              ${inputField("optPopulation", "Популяция", "10", "number")}
-              ${inputField("optTargetCl", "Целевой CL", "0.55", "number")}
-              ${inputField("optVelocity", "Скорость (м/с)", "50", "number")}
-            </div>
-          </div>
         </div>
       `;
     }
@@ -749,7 +1023,7 @@ def html_page() -> str:
 
     function renderGeneralPanel() {
       document.getElementById("tab-general").innerHTML = generalPanelHtml();
-      ["airplane_name", "fuselage_name", "airfoil_name", "fuselage_symmetry", "draw_backend", "optIterations", "optPopulation", "optTargetCl", "optVelocity"].forEach(id => {
+      ["airplane_name", "fuselage_name", "airfoil_name", "fuselage_symmetry", "draw_backend"].forEach(id => {
         document.getElementById(id).addEventListener("input", syncGeneralFields);
         document.getElementById(id).addEventListener("change", syncGeneralFields);
       });
@@ -980,16 +1254,22 @@ def html_page() -> str:
     function collectProjectionBounds(config, view) {
       const xs = [];
       const projectionValues = [];
+      const fuselageChains = [
+        ...(Array.isArray(config.fuselage_sections) ? [config.fuselage_sections] : []),
+        ...((Array.isArray(config.extra_fuselages) ? config.extra_fuselages : []).filter(Array.isArray)),
+      ];
 
-      config.fuselage_sections.forEach(section => {
-        const x = number(section.x);
-        const radius = number(section.radius);
-        xs.push(x - radius, x + radius);
-        if (view === "top") {
-          projectionValues.push(number(section.y) - radius, number(section.y) + radius);
-        } else {
-          projectionValues.push(number(section.z) - radius, number(section.z) + radius);
-        }
+      fuselageChains.forEach(chain => {
+        chain.forEach(section => {
+          const x = number(section.x);
+          const radius = number(section.radius);
+          xs.push(x - radius, x + radius);
+          if (view === "top") {
+            projectionValues.push(number(section.y) - radius, number(section.y) + radius);
+          } else {
+            projectionValues.push(number(section.z) - radius, number(section.z) + radius);
+          }
+        });
       });
 
       ["canard", "wing", "htail", "vtail"].forEach(key => {
@@ -1227,6 +1507,102 @@ def html_page() -> str:
         drawAircraftPreview(ctx, optimizedState, rect.width, halfHeight, padding, boundsTop, boundsSide, halfHeight, true);
       }
       renderSummary();
+      drawStabilityChart6();
+    }
+
+    function drawStabilityChart6() {
+      const canvas = document.getElementById("stabilityChart6");
+      const metricsEl = document.getElementById("stabilityMetrics");
+      if (!canvas) return;
+      const ctx = canvas.getContext("2d");
+      const ratio = window.devicePixelRatio || 1;
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = Math.max(320, rect.width) * ratio;
+      canvas.height = rect.height * ratio;
+      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+      ctx.clearRect(0, 0, rect.width, rect.height);
+
+      if (!stabilityChart6Data || !stabilityChart6Data.categories || !stabilityChart6Data.values) {
+        ctx.fillStyle = "#5a7286";
+        ctx.font = "14px Segoe UI";
+        ctx.fillText("Нет данных: нажмите «Проверить стабильность» или завершите оптимизацию.", 16, 36);
+        return;
+      }
+
+      const categories = stabilityChart6Data.categories;
+      const values = stabilityChart6Data.values;
+      const padL = 52;
+      const padR = 16;
+      const padT = 40;
+      const padB = 72;
+      const w = rect.width - padL - padR;
+      const h = rect.height - padT - padB;
+      const n = categories.length;
+      const gap = 8;
+      const barW = Math.max(14, (w - gap * (n - 1)) / n);
+
+      ctx.fillStyle = "#28455f";
+      ctx.font = "600 15px Segoe UI";
+      ctx.fillText("График 6 — статистика ограничений (0 = нет, 1 = да)", padL, 22);
+
+      for (let i = 0; i < n; i++) {
+        const v = values[i] ? 1 : 0;
+        const x0 = padL + i * (barW + gap);
+        const bh = v * h;
+        const y0 = padT + (h - bh);
+        let fill = "#c62828";
+        if (i === 0) fill = "#546e7a";
+        else if (v === 1) fill = "#209460";
+        ctx.fillStyle = fill;
+        ctx.fillRect(x0, y0, barW, bh || 2);
+        ctx.strokeStyle = "#173047";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(x0, y0, barW, bh || 2);
+        ctx.fillStyle = "#173047";
+        ctx.font = "bold 12px Segoe UI";
+        ctx.textAlign = "center";
+        ctx.fillText(String(v), x0 + barW / 2, y0 - 6);
+        ctx.save();
+        ctx.translate(x0 + barW / 2, padT + h + 14);
+        ctx.rotate(-Math.PI / 4);
+        ctx.textAlign = "right";
+        ctx.font = "11px Segoe UI";
+        ctx.fillStyle = "#5a7286";
+        ctx.fillText(categories[i], 0, 0);
+        ctx.restore();
+      }
+
+      ctx.strokeStyle = "#cad7e4";
+      ctx.beginPath();
+      ctx.moveTo(padL, padT + h);
+      ctx.lineTo(padL + w, padT + h);
+      ctx.stroke();
+      ctx.textAlign = "left";
+      if (metricsEl && stabilityEvaluationText) {
+        metricsEl.textContent = stabilityEvaluationText;
+      }
+    }
+
+    async function fetchStabilityFromServer() {
+      syncGeneralFields();
+      setStatus("Проверка стабильности (AeroBuildup)...");
+      try {
+        const data = await postJson("/api/evaluate_stability", {
+          config: state,
+          options: getOptimizationOptions(),
+        });
+        stabilityChart6Data = data.chart6 || null;
+        const ev = data.evaluation || {};
+        stabilityEvaluationText =
+          `Score: ${(ev.score ?? 0).toFixed(3)}  |  L/D: ${(ev.efficiency ?? 0).toFixed(2)}  |  ` +
+          `CL: ${(ev.CL ?? 0).toFixed(4)}  CD: ${(ev.CD ?? 0).toFixed(5)}\\n` +
+          `Clp: ${(ev.Clp ?? 0).toFixed(5)} (крен)  |  Cnr: ${(ev.Cnr ?? 0).toFixed(5)} (рысканье)  |  ` +
+          `Cma: ${(ev.Cma ?? 0).toFixed(4)} (тангаж)  |  Валидность ТЗ: ${ev.is_valid ? "да" : "нет"}`;
+        drawStabilityChart6();
+        setStatus("Стабильность обновлена по текущей конфигурации.");
+      } catch (error) {
+        setStatus(error.message);
+      }
     }
 
     function drawAircraftPreview(ctx, config, width, height, padding, boundsTop, boundsSide, sideOffsetY, isOverlay) {
@@ -1246,27 +1622,33 @@ def html_page() -> str:
       ctx.stroke();
       ctx.setLineDash([]);
 
-      const sections = [...config.fuselage_sections].sort((lhs, rhs) => number(lhs.x) - number(rhs.x));
-      for (let i = 0; i < sections.length - 1; i++) {
-        const left = sections[i];
-        const right = sections[i + 1];
-        const p1 = mapPoint(number(left.x), number(left.y) + number(left.radius), bounds, width, height, padding);
-        const p2 = mapPoint(number(right.x), number(right.y) + number(right.radius), bounds, width, height, padding);
-        const p3 = mapPoint(number(right.x), number(right.y) - number(right.radius), bounds, width, height, padding);
-        const p4 = mapPoint(number(left.x), number(left.y) - number(left.radius), bounds, width, height, padding);
-        ctx.beginPath();
-        ctx.moveTo(p1.x, p1.y);
-        ctx.lineTo(p2.x, p2.y);
-        ctx.lineTo(p3.x, p3.y);
-        ctx.lineTo(p4.x, p4.y);
-        ctx.closePath();
-        ctx.fillStyle = isOverlay ? "rgba(255, 140, 59, 0.16)" : "#d8e6f6";
-        ctx.fill();
-        ctx.strokeStyle = isOverlay ? "#ff8c3b" : "#416688";
-        if (isOverlay) ctx.setLineDash([8, 5]);
-        ctx.stroke();
-        if (isOverlay) ctx.setLineDash([]);
-      }
+      const fuselageChains = [
+        ...(Array.isArray(config.fuselage_sections) ? [config.fuselage_sections] : []),
+        ...((Array.isArray(config.extra_fuselages) ? config.extra_fuselages : []).filter(Array.isArray)),
+      ];
+      fuselageChains.forEach(chain => {
+        const sections = [...chain].sort((lhs, rhs) => number(lhs.x) - number(rhs.x));
+        for (let i = 0; i < sections.length - 1; i++) {
+          const left = sections[i];
+          const right = sections[i + 1];
+          const p1 = mapPoint(number(left.x), number(left.y) + number(left.radius), bounds, width, height, padding);
+          const p2 = mapPoint(number(right.x), number(right.y) + number(right.radius), bounds, width, height, padding);
+          const p3 = mapPoint(number(right.x), number(right.y) - number(right.radius), bounds, width, height, padding);
+          const p4 = mapPoint(number(left.x), number(left.y) - number(left.radius), bounds, width, height, padding);
+          ctx.beginPath();
+          ctx.moveTo(p1.x, p1.y);
+          ctx.lineTo(p2.x, p2.y);
+          ctx.lineTo(p3.x, p3.y);
+          ctx.lineTo(p4.x, p4.y);
+          ctx.closePath();
+          ctx.fillStyle = isOverlay ? "rgba(255, 140, 59, 0.16)" : "#d8e6f6";
+          ctx.fill();
+          ctx.strokeStyle = isOverlay ? "#ff8c3b" : "#416688";
+          if (isOverlay) ctx.setLineDash([8, 5]);
+          ctx.stroke();
+          if (isOverlay) ctx.setLineDash([]);
+        }
+      });
 
       ["canard", "wing", "htail", "vtail"].forEach(key => {
         const surface = config[key];
@@ -1291,25 +1673,31 @@ def html_page() -> str:
       ctx.stroke();
       ctx.setLineDash([]);
 
-      const top = [];
-      const bottom = [];
-      [...config.fuselage_sections].sort((lhs, rhs) => number(lhs.x) - number(rhs.x)).forEach(section => {
-        top.push(mapSide(number(section.x), number(section.z) + number(section.radius)));
-        bottom.push(mapSide(number(section.x), number(section.z) - number(section.radius)));
+      const fuselageChains = [
+        ...(Array.isArray(config.fuselage_sections) ? [config.fuselage_sections] : []),
+        ...((Array.isArray(config.extra_fuselages) ? config.extra_fuselages : []).filter(Array.isArray)),
+      ];
+      fuselageChains.forEach(chain => {
+        const top = [];
+        const bottom = [];
+        [...chain].sort((lhs, rhs) => number(lhs.x) - number(rhs.x)).forEach(section => {
+          top.push(mapSide(number(section.x), number(section.z) + number(section.radius)));
+          bottom.push(mapSide(number(section.x), number(section.z) - number(section.radius)));
+        });
+        if (top.length >= 2) {
+          ctx.beginPath();
+          ctx.moveTo(top[0].x, top[0].y);
+          top.slice(1).forEach(point => ctx.lineTo(point.x, point.y));
+          bottom.reverse().forEach(point => ctx.lineTo(point.x, point.y));
+          ctx.closePath();
+          ctx.fillStyle = isOverlay ? "rgba(255, 140, 59, 0.16)" : "#d8e6f6";
+          ctx.fill();
+          ctx.strokeStyle = isOverlay ? "#ff8c3b" : "#416688";
+          if (isOverlay) ctx.setLineDash([8, 5]);
+          ctx.stroke();
+          if (isOverlay) ctx.setLineDash([]);
+        }
       });
-      if (top.length >= 2) {
-        ctx.beginPath();
-        ctx.moveTo(top[0].x, top[0].y);
-        top.slice(1).forEach(point => ctx.lineTo(point.x, point.y));
-        bottom.reverse().forEach(point => ctx.lineTo(point.x, point.y));
-        ctx.closePath();
-        ctx.fillStyle = isOverlay ? "rgba(255, 140, 59, 0.16)" : "#d8e6f6";
-        ctx.fill();
-        ctx.strokeStyle = isOverlay ? "#ff8c3b" : "#416688";
-        if (isOverlay) ctx.setLineDash([8, 5]);
-        ctx.stroke();
-        if (isOverlay) ctx.setLineDash([]);
-      }
 
       ["canard", "wing", "htail", "vtail"].forEach(key => {
         const surface = config[key];
@@ -1323,10 +1711,10 @@ def html_page() -> str:
         .map(key => state[key].name)
         .join(", ") || "нет";
       document.getElementById("summary").textContent =
-        `Самолёт: ${state.airplane_name}\n` +
-        `Профиль: ${state.airfoil_name}\n` +
-        `Длина фюзеляжа: ${getFuselageLength(state).toFixed(3)}\n` +
-        `Активные поверхности: ${enabled}\n` +
+        `Самолёт: ${state.airplane_name}\\n` +
+        `Профиль: ${state.airfoil_name}\\n` +
+        `Длина фюзеляжа: ${getFuselageLength(state).toFixed(3)}\\n` +
+        `Активные поверхности: ${enabled}\\n` +
         `Секций фюзеляжа: ${state.fuselage_sections.length}`;
 
       const optimizationSummary = document.getElementById("optimizationSummary");
@@ -1334,20 +1722,53 @@ def html_page() -> str:
         optimizationSummary.textContent = "Оптимизация ещё не запускалась.";
         return;
       }
-      const wing = optimizationResult.geometry?.wing;
-      const canard = optimizationResult.geometry?.canard;
+      
+      const evaluation = optimizationResult;
       const currentLength = getFuselageLength(state).toFixed(3);
       const optimizedLength = getFuselageLength(optimizedState).toFixed(3);
-      optimizationSummary.textContent =
-        `Оптимизированная конфигурация\n` +
-        `Score: ${optimizationResult.score.toFixed(3)}\n` +
-        `L/D: ${optimizationResult.best_point.L_over_D.toFixed(3)}\n` +
-        `CL: ${optimizationResult.best_point.CL.toFixed(3)} | CD: ${optimizationResult.best_point.CD.toFixed(4)}\n` +
-        `Cm: ${optimizationResult.best_point.Cm.toFixed(3)} | Cma: ${optimizationResult.best_point.Cma.toFixed(3)}\n` +
-        `Alpha: ${optimizationResult.best_point.alpha.toFixed(2)} deg\n` +
-        (wing ? `Крыло: span=${wing.full_span.toFixed(3)}, area=${wing.area.toFixed(3)}, root=${wing.root_chord.toFixed(3)}, tip=${wing.tip_chord.toFixed(3)}\n` : "") +
-        (canard ? `ПГО: span=${canard.full_span.toFixed(3)}, area=${canard.area.toFixed(3)}, root=${canard.root_chord.toFixed(3)}, tip=${canard.tip_chord.toFixed(3)}\n` : "") +
-        `Длина текущая/оптимум: ${currentLength} / ${optimizedLength}`;
+      
+      // Обработка разных форматов результатов (AI/Algorithm/Hybrid)
+      let summary = "Оптимизированная конфигурация\\n";
+      
+      if (evaluation.score !== undefined) {
+        summary += `Score: ${evaluation.score.toFixed(3)}\\n`;
+      }
+      
+      if (evaluation.efficiency !== undefined) {
+        summary += `Efficiency (CL/CD): ${evaluation.efficiency.toFixed(3)}\\n`;
+      } else if (evaluation.L_over_D !== undefined) {
+        summary += `L/D: ${evaluation.L_over_D.toFixed(3)}\\n`;
+      }
+      
+      summary += `CL: ${(evaluation.CL || evaluation.Cl || 0).toFixed(3)} | `;
+      summary += `CD: ${(evaluation.CD || evaluation.Cd || 0).toFixed(4)}\\n`;
+      summary += `Cm: ${(evaluation.Cm || 0).toFixed(3)} | `;
+      summary += `Cma: ${(evaluation.Cma || evaluation.Cma || 0).toFixed(3)}\\n`;
+      
+      if (evaluation.Clp !== undefined) {
+        summary += `Clp (roll damping): ${evaluation.Clp.toFixed(4)} ${evaluation.Clp < -0.01 ? "✓" : "✗"}\\n`;
+      }
+      if (evaluation.Cnr !== undefined) {
+        summary += `Cnr (yaw stability): ${evaluation.Cnr.toFixed(4)} ${evaluation.Cnr < -0.01 ? "✓" : "✗"}\\n`;
+      }
+      if (evaluation.constraints_violation !== undefined) {
+        summary += `Ограничения: ${evaluation.constraints_violation.toFixed(3)} ${evaluation.constraints_violation <= 1e-6 ? "✓" : "✗"}\\n`;
+      }
+      if (evaluation.is_valid !== undefined) {
+        summary += `Валидность ТЗ: ${evaluation.is_valid ? "✓" : "✗"}\\n`;
+      }
+      
+      if (evaluation.wing_area !== undefined) {
+        summary += `Wing area: ${evaluation.wing_area.toFixed(3)}\\n`;
+      }
+      
+      if (evaluation.alpha !== undefined) {
+        summary += `Alpha: ${evaluation.alpha.toFixed(2)} deg\\n`;
+      }
+      
+      summary += `Длина текущая/оптимум: ${currentLength} / ${optimizedLength}`;
+      
+      optimizationSummary.textContent = summary;
     }
 
     function redraw() {
@@ -1376,8 +1797,10 @@ def html_page() -> str:
 
     function getOptimizationOptions() {
       return {
+        mode: document.getElementById("optMode").value || "algorithm",
         iterations: Math.max(1, Math.round(number(document.getElementById("optIterations").value, 10))),
         population: Math.max(4, Math.round(number(document.getElementById("optPopulation").value, 20))),
+        min_wing_area: number(document.getElementById("optMinWingArea").value, 0.3),
         target_cl: number(document.getElementById("optTargetCl").value, 0.55),
         velocity: number(document.getElementById("optVelocity").value, 50),
       };
@@ -1385,16 +1808,35 @@ def html_page() -> str:
 
     async function runOptimization() {
       syncGeneralFields();
-      setStatus("Идёт оптимизация геометрии...");
+      const mode = document.getElementById("optMode").value || "algorithm";
+      const modeNames = {
+        "algorithm": "🧬 Алгоритм (CEM)",
+        "ai": "🤖 AI (Нейросеть)",
+        "ai+algorithm": "🔄 Гибридный (AI+CEM)",
+      };
+      setStatus(`Оптимизация (${modeNames[mode]})...`);
       try {
         const data = await postJson("/api/optimize", {
           config: state,
           options: getOptimizationOptions(),
         });
+        if (data.error) {
+          setStatus(`Ошибка: ${data.error}`);
+          return;
+        }
         optimizedState = data.optimized_config;
         optimizationResult = data.evaluation;
+        if (data.chart6) {
+          stabilityChart6Data = data.chart6;
+          const ev = data.evaluation || {};
+          stabilityEvaluationText =
+            `Оптимум — Score: ${(ev.score ?? 0).toFixed(3)}  |  L/D: ${(ev.efficiency ?? 0).toFixed(2)}  |  ` +
+            `CL: ${(ev.CL ?? 0).toFixed(4)}  CD: ${(ev.CD ?? 0).toFixed(5)}\\n` +
+            `Clp: ${(ev.Clp ?? 0).toFixed(5)}  |  Cnr: ${(ev.Cnr ?? 0).toFixed(5)}  |  Cma: ${(ev.Cma ?? 0).toFixed(4)}  |  ТЗ: ${ev.is_valid ? "да" : "нет"}`;
+        }
         redraw();
-        setStatus("Оптимизация завершена. Оранжевый пунктир показывает найденный вариант.");
+        const modeStage = data.evaluation.mode ? `[${modeNames[data.evaluation.mode]}]` : "";
+        setStatus(`✓ Оптимизация завершена ${modeStage}. Оранжевый пунктир показывает найденный вариант.`);
       } catch (error) {
         setStatus(error.message);
       }
@@ -1405,7 +1847,7 @@ def html_page() -> str:
         setStatus("Сначала нужно получить оптимизированную конфигурацию.");
         return;
       }
-      state = structuredClone(optimizedState);
+      state = deepClone(optimizedState);
       renderAll();
       setStatus("Оптимизированная геометрия применена и доступна для ручного редактирования.");
     }
@@ -1417,15 +1859,25 @@ def html_page() -> str:
       setStatus("Оптимизированный слой скрыт.");
     }
 
+    function clearStabilityChart() {
+      stabilityChart6Data = null;
+      stabilityEvaluationText = "";
+      const metricsEl = document.getElementById("stabilityMetrics");
+      if (metricsEl) metricsEl.textContent = "Метрики появятся после проверки.";
+      drawStabilityChart6();
+    }
+
     function wireToolbar() {
       document.getElementById("newProjectBtn").addEventListener("click", () => {
-        state = structuredClone(defaultConfig);
+        state = deepClone(defaultConfig);
         optimizedState = null;
         optimizationResult = null;
+        clearStabilityChart();
         renderAll();
         setStatus("Создан новый проект.");
       });
       document.getElementById("refreshBtn").addEventListener("click", redraw);
+      document.getElementById("stabilityBtn").addEventListener("click", fetchStabilityFromServer);
       document.getElementById("scaleFuselageBtn").addEventListener("click", scaleFuselageToTargetLength);
       document.getElementById("optimizeBtn").addEventListener("click", runOptimization);
       document.getElementById("applyOptimizedBtn").addEventListener("click", applyOptimizedState);
@@ -1445,6 +1897,7 @@ def html_page() -> str:
           state = JSON.parse(await file.text());
           optimizedState = null;
           optimizationResult = null;
+          clearStabilityChart();
           renderAll();
           setStatus(`JSON загружен: ${file.name}`);
         } catch (error) {
@@ -1555,28 +2008,71 @@ class DesignerHandler(BaseHTTPRequestHandler):
                     }
                 )
                 return
+            if parsed.path == "/api/evaluate_stability":
+                import SCAT.AERO.wing_optimizer as wing_optimizer_mod
+
+                config = config_from_dict(payload.get("config", {}))
+                opts = payload.get("options", {})
+                velocity = float(opts.get("velocity", 50.0))
+                target_cl = float(opts.get("target_cl", 0.55))
+                min_wing_area = float(opts.get("min_wing_area", 0.3))
+                alpha = float(opts.get("alpha", 0.0))
+                span = wing_optimizer_mod.extract_wing_metrics(config.wing).span
+                ev = wing_optimizer_mod.evaluate_wing_design(
+                    config,
+                    velocity=velocity,
+                    target_cl=target_cl,
+                    min_wing_area=min_wing_area,
+                    max_wing_span=span,
+                    alpha=alpha,
+                    relax_mode=False,
+                )
+                chart6 = wing_optimizer_mod.stability_chart6_payload(
+                    ev,
+                    min_wing_area=min_wing_area,
+                    max_wing_span=span,
+                )
+                st = ev.stability
+                self._send_json(
+                    {
+                        "chart6": chart6,
+                        "evaluation": {
+                            "score": float(ev.score),
+                            "efficiency": float(ev.efficiency),
+                            "CL": float(st.Cl),
+                            "CD": float(st.Cd),
+                            "Cm": float(st.Cm),
+                            "Cma": float(st.Cma),
+                            "Clp": float(st.Clp),
+                            "Cnr": float(st.Cnr),
+                            "wing_area": float(ev.wing.area),
+                            "wing_span": float(ev.wing.span),
+                            "geometry_penalty": float(ev.geometry_penalty),
+                            "constraints_violation": float(ev.constraints_violation),
+                            "is_valid": ev.is_valid(min_wing_area=min_wing_area, max_wing_span=span),
+                        },
+                    }
+                )
+                return
             if parsed.path == "/api/optimize":
-                import SCAT.AERO.optimizer as optimizer
+                import SCAT.AERO.wing_optimization_v2 as opt_engine
 
                 config = config_from_dict(payload.get("config", {}))
                 options = payload.get("options", {})
-                best_vector, evaluation = optimizer.optimize_design(
-                    base_config=config,
+                
+                # Использовать новый оптимизатор с поддержкой разных режимов
+                engine = opt_engine.WingOptimizationEngine(config)
+                result = engine.optimize(
+                    mode=options.get("mode", "algorithm"),
                     iterations=max(1, int(options.get("iterations", 10))),
                     population=max(4, int(options.get("population", 20))),
-                    elite_fraction=0.25,
-                    seed=42,
                     velocity=float(options.get("velocity", 50.0)),
                     target_cl=float(options.get("target_cl", 0.55)),
+                    min_wing_area=float(options.get("min_wing_area", 0.3)),
+                    seed=42,
                 )
-                optimized_config = optimizer.apply_design_vector(config, best_vector)
-                self._send_json(
-                    {
-                        "optimized_config": config_to_dict(optimized_config),
-                        "evaluation": evaluation,
-                        "parameters": optimizer.vector_to_dict(best_vector),
-                    }
-                )
+                
+                self._send_json(result)
                 return
         except Exception as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)

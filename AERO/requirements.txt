@@ -1,0 +1,12 @@
+# Core math / aero
+numpy
+aerosandbox
+
+# Optional plotting / analysis scripts
+matplotlib
+
+# Web and 3D preview backend used by AeroSandbox draw(backend="pyvista")
+pyvista
+
+# ML optimizer mode (AI / AI+Algorithm)
+tensorflow

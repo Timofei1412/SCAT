@@ -1,0 +1,9 @@
+{
+  "y_mean": 5.2732088097084056,
+  "y_std": 4.273788053036218,
+  "input_dim": 45,
+  "spec_count": 45,
+  "train_samples": 1000,
+  "only_valid": false,
+  "history_epochs": 88
+}

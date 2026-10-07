@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import SCAT.AERO.main as main
+import SCAT.AERO.wing_optimizer as wing_opt
 import numpy as np
 
 
@@ -140,7 +141,6 @@ def apply_design_vector(base_config: main.AircraftConfig, vector: np.ndarray) ->
     params = vector_to_dict(vector)
 
     ensure_surface_ready(config.wing, "Main Wing")
-    ensure_surface_ready(config.canard, "Canard")
 
     config.wing.sections = transform_surface_sections(
         sections=config.wing.sections,
@@ -160,19 +160,21 @@ def apply_design_vector(base_config: main.AircraftConfig, vector: np.ndarray) ->
         twist_scale=params["wing_twist_scale"],
     )
 
-    config.canard.sections = transform_surface_sections(
-        sections=config.canard.sections,
-        x_shift=params["canard_x_shift"],
-        y_shift=params["canard_y_shift"],
-        span_scale=params["canard_span_scale"],
-        sweep_scale=params["canard_sweep_scale"],
-        z_shift=params["canard_z_shift"],
-        z_scale=1.0,
-        global_chord_scale=params["canard_chord_global_scale"],
-        chord_scales=[params["canard_chord_scale"]] * len(config.canard.sections),
-        twist_bias=params["canard_twist_bias"],
-        twist_scale=params["canard_twist_scale"],
-    )
+    if config.canard.enabled and len(config.canard.sections) >= 2:
+        ensure_surface_ready(config.canard, "Canard")
+        config.canard.sections = transform_surface_sections(
+            sections=config.canard.sections,
+            x_shift=params["canard_x_shift"],
+            y_shift=params["canard_y_shift"],
+            span_scale=params["canard_span_scale"],
+            sweep_scale=params["canard_sweep_scale"],
+            z_shift=params["canard_z_shift"],
+            z_scale=1.0,
+            global_chord_scale=params["canard_chord_global_scale"],
+            chord_scales=[params["canard_chord_scale"]] * len(config.canard.sections),
+            twist_bias=params["canard_twist_bias"],
+            twist_scale=params["canard_twist_scale"],
+        )
 
     if config.htail.enabled and len(config.htail.sections) >= 2:
         ensure_surface_ready(config.htail, "Horizontal Tail")
@@ -212,7 +214,7 @@ def apply_design_vector(base_config: main.AircraftConfig, vector: np.ndarray) ->
 def geometry_penalty(config: main.AircraftConfig) -> float:
     penalty = 0.0
     for surface in (config.wing, config.canard, config.htail):
-        if not surface.enabled:
+        if not surface.enabled or len(surface.sections) < 2:
             continue
         ys = [section.y for section in surface.sections]
         chords = [section.chord for section in surface.sections]
@@ -224,14 +226,25 @@ def geometry_penalty(config: main.AircraftConfig) -> float:
             if right > left * 1.35:
                 penalty += 5.0 + (right - left) * 4.0
 
-    wing_tip = config.wing.sections[-1]
-    canard_tip = config.canard.sections[-1]
-    if wing_tip.y <= canard_tip.y:
-        penalty += 10.0
-    if config.htail.enabled and config.htail.sections[-1].y <= 0.4:
+    if (
+        config.wing.enabled
+        and len(config.wing.sections) >= 2
+        and config.canard.enabled
+        and len(config.canard.sections) >= 2
+    ):
+        wing_tip = config.wing.sections[-1]
+        canard_tip = config.canard.sections[-1]
+        if wing_tip.y <= canard_tip.y:
+            penalty += 10.0
+    if (
+        config.htail.enabled
+        and len(config.htail.sections) > 0
+        and config.htail.sections[-1].y <= 0.4
+    ):
         penalty += 5.0
-    if config.vtail.enabled:
+    if config.vtail.enabled and len(config.vtail.sections) >= 2:
         zs = [section.z for section in config.vtail.sections]
+
         if any(right <= left for left, right in zip(zs, zs[1:])):
             penalty += 10.0
     return penalty
@@ -587,6 +600,16 @@ def build_parser() -> argparse.ArgumentParser:
     sample.add_argument("--samples", type=int, default=150, help="Количество примеров в датасете.")
     sample.add_argument("--output", type=str, default="dataset.jsonl", help="Куда сохранить датасет.")
 
+    sample_v2 = subparsers.add_parser("sample-v2", parents=[common], help="Сгенерировать датасет v2 с per-section параметрами.")
+    sample_v2.add_argument("--samples", type=int, default=200, help="Количество примеров в датасете.")
+    sample_v2.add_argument("--output", type=str, default="wing_dataset_v2.jsonl", help="Куда сохранить датасет v2.")
+    sample_v2.add_argument("--baseline-ratio", type=float, default=0.7, help="Доля конфигураций вокруг базового дизайна.")
+    sample_v2.add_argument(
+        "--include-invalid",
+        action="store_true",
+        help="Записывать и невалидные конфигурации. По умолчанию в JSONL только строки с is_valid.",
+    )
+
     optimize = subparsers.add_parser("optimize", parents=[common], help="Прямая оптимизация через CEM.")
     optimize.add_argument("--iterations", type=int, default=12, help="Количество итераций оптимизации.")
     optimize.add_argument("--population", type=int, default=32, help="Популяция на итерацию.")
@@ -609,8 +632,41 @@ def main_cli() -> None:
     args = parser.parse_args()
     base_config = load_config(args.config)
 
+    if args.command == "sample-v2":
+        print(
+            "\n── sample-v2: почему цифры могут отличаться от baseTim.py ──\n"
+            f"• Ниже «Базовая конструкция» — evaluate_design: AeroBuildup, V={args.velocity:g} м/с, "
+            "перебор угла атаки в диапазоне, выбирается лучшая точка (часто α несколько градусов, CL близок к --target-cl).\n"
+            "• Строки wing_dataset_v2 — evaluate_wing_design: тот же AeroBuildup и V, но фиксированно α=0° и те же "
+            "relax_mode / ослабленные target_cl и min_wing_area, что при записи JSONL.\n"
+            "• baseTim.py считает VortexLatticeMethod при V=25 м/с и α=3° — другой метод и режим полёта, CL/L/D не обязаны совпадать.\n"
+        )
+
     baseline_eval = evaluate_design(base_config, velocity=args.velocity, target_cl=args.target_cl)
     print_evaluation("Базовая конструкция", baseline_eval)
+
+    if args.command == "sample-v2":
+        span_lim = wing_opt.extract_wing_metrics(base_config.wing).span
+        wing_baseline = wing_opt.evaluate_wing_design(
+            base_config,
+            velocity=args.velocity,
+            target_cl=args.target_cl * 0.9,
+            min_wing_area=0.3 * 0.7,
+            max_wing_span=span_lim,
+            relax_mode=True,
+            alpha=0.0,
+            _debug_idx=999,
+        )
+        sm = wing_baseline.stability
+        print("\nБазовая конструкция (как в строках датасета v2, evaluate_wing_design, α=0°)")
+        print(f"  score            : {wing_baseline.score:.3f}")
+        print(f"  geometry_penalty : {wing_baseline.geometry_penalty:.3f}")
+        print(f"  alpha            : 0.000 deg (фиксировано)")
+        print(f"  CL               : {sm.Cl:.4f}")
+        print(f"  CD               : {sm.Cd:.4f}")
+        print(f"  L/D              : {wing_baseline.efficiency:.4f}")
+        print(f"  Cm               : {sm.Cm:.4f}")
+        print(f"  Cma              : {sm.Cma:.4f}")
 
     if args.command == "sample":
         generate_dataset(
@@ -620,6 +676,21 @@ def main_cli() -> None:
             seed=args.seed,
             velocity=args.velocity,
             target_cl=args.target_cl,
+        )
+        return
+
+    if args.command == "sample-v2":
+        wing_opt.generate_wing_dataset_v2(
+            base_config=base_config,
+            sample_count=args.samples,
+            output_path=args.output,
+            seed=args.seed,
+            velocity=args.velocity,
+            target_cl=args.target_cl,
+            min_wing_area=0.3,
+            relax_mode=True,
+            baseline_ratio=args.baseline_ratio,
+            only_valid=not args.include_invalid,
         )
         return
 
